@@ -1,22 +1,31 @@
-use slam::{Slam};
+use rand::Rng;
+use slam::Slam;
 
 fn main() {
     println!("Hello, world!");
 
-    let mut slam = Slam::new();
+    let mut rng = rand::rng();
 
-    let p1 = slam.create_player(1624618619);
-    let p2 = slam.insert_player(6264146811, 110);
-    let p3 = slam.insert_player(3252523521, 150);
+    let mut slam = Slam::<6>::new();
 
-    slam.queue_player(p1);
-    slam.queue_player(p2);
-    slam.queue_player(p3);
-
-    let matchup = slam.poll_queue();
-    if matchup.is_some() {
-        println!("{:?}", matchup.unwrap());
-    } else {
-        println!("No matchup!");
+    for _ in 0..24 {
+        let p = slam.insert_player(rng.random(), rng.random_range(100..1000));
+        slam.queue_player(p);
     }
+
+    for (k,v) in slam.db.iter() {
+        println!("{} => {}", k.id, v);
+    }
+
+    for _ in 0..4 {
+        let matchup = slam.poll_queue();
+
+        if matchup.is_some() {
+            println!("{:?}", matchup.unwrap());
+        } else {
+            println!("No matchup!");
+        }
+    }
+
+    // TODO: bind difference between team members' ELO
 }

@@ -7,3 +7,5 @@ description = "An ELO-based matchmaking system for multiplayer games"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+microlp = "0.2.11"
+rand = "0.9.2"
