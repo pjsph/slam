@@ -1,6 +1,36 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
 
 use microlp::{LinearExpr, OptimizationDirection, Problem, ComparisonOp};
+
+use serde::Deserialize;
+
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+pub enum Error {
+    IoError(std::io::Error),
+    SerdeError(serde_json::Error),
+}
+
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            Error::IoError(err) => write!(f, "{:?}", err),
+            Error::SerdeError(err) => write!(f, "{:?}", err),
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Error::IoError(value)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(value: serde_json::Error) -> Self {
+        Error::SerdeError(value)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SlamId {
@@ -41,13 +71,36 @@ impl SlamIdQueued {
     }
 }
 
-pub struct Group<const N: usize> {
-    players: [SlamIdQueued; N],
+#[derive(Debug, Deserialize)]
+pub struct SlamConfig {
+    group_size: u8,
+    teams_per_match: u8,
+}
+
+impl SlamConfig {
+    pub fn new(group_size: u8, teams_per_match: u8) -> Self {
+        SlamConfig {
+            group_size,
+            teams_per_match,
+        }
+    }
+
+    pub fn load_from_file<P: AsRef<Path>>(path: P)-> Result<Self, Error> {
+        let f = File::open(path)?;
+        let reader = BufReader::new(f);
+        let config: SlamConfig = serde_json::from_reader(reader)?;
+        Ok(config)
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub struct Group {
+    players: Vec<SlamIdQueued>,
     total_elo: u64,
 }
 
-impl<const N: usize> Group<N> {
-    pub fn new(players: [SlamIdQueued; N], total_elo: u64) -> Self {
+impl Group {
+    pub fn new(players: Vec<SlamIdQueued>, total_elo: u64) -> Self {
         Group {
             players,
             total_elo,       
@@ -55,12 +108,12 @@ impl<const N: usize> Group<N> {
     }
 }
 
-impl<const N: usize> std::fmt::Debug for Group<N> {
+impl std::fmt::Debug for Group {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         write!(f, "[")?;
         for (i, player) in self.players.iter().enumerate() {
             write!(f, "{}", player.id)?;
-            if i < N - 1 {
+            if i < self.players.len() - 1 {
                 write!(f, ", ")?;
             }
         }
@@ -68,36 +121,47 @@ impl<const N: usize> std::fmt::Debug for Group<N> {
     }
 }
 
-pub struct Match<const N: usize> {
-    g1: Group<N>,
-    g2: Group<N>,
+#[derive(PartialEq, Eq, Hash)]
+pub struct Match {
+    g1: Group,
+    g2: Group,
 }
 
-impl<const N: usize> Match<N> {
-    fn new(g1: Group<N>, g2: Group<N>) -> Self {
+impl Match {
+    fn new(g1: Group, g2: Group) -> Self {
         Match {
             g1,
             g2,
         }
     }
+
+    fn get_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
-impl<const N: usize> std::fmt::Debug for Match<N> {
+impl std::fmt::Debug for Match {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         write!(f, "{:?} vs {:?}", self.g1, self.g2)
     }
 }
 
-pub struct Slam<const N: usize> {
+pub struct Slam {
     pub db: HashMap<SlamId, u64>,
     pub queue: Vec<SlamIdQueued>,
+    ongoing_matches: HashMap<u64, Match>,
+    config: SlamConfig,
 }
 
-impl<const N: usize> Slam<N> {
-    pub fn new() -> Self {
+impl Slam {
+    pub fn new(config: SlamConfig) -> Self {
         Slam {
             db: HashMap::new(),
             queue: Vec::new(),
+            ongoing_matches: HashMap::new(),
+            config,
         }
     }
 
@@ -119,13 +183,15 @@ impl<const N: usize> Slam<N> {
         queued_id
     }
 
-    pub fn poll_queue(&mut self) -> Option<Match<N>> {
+    pub fn poll_queue(&mut self) -> Option<Match> {
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let i = self.queue.len();
         let j = 2usize;
+        let N = self.config.group_size;
 
         let xs: Vec<_> = (0..i*j).map(|_| problem.add_binary_var(0.0)).collect();
         let avgs: Vec<_> = (0..j).map(|_| problem.add_var(0.0, (0.0, f64::INFINITY))).collect();
+        let ys: Vec<_> = (0..i*(i-1)*j/2).map(|_| problem.add_binary_var(0.0)).collect();
         let z = problem.add_var(1.0, (0.0, f64::INFINITY));
 
         // sum(j, x(i,j)) <= 1 for all i
@@ -146,6 +212,30 @@ impl<const N: usize> Slam<N> {
             }
             problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
         }
+        // map y(i1,i2,j) to x(i1,j)*x(i2,j)
+        // y(i1,i2,j) <= x(i1,j)
+        // y(i1,i2,j) <= x(i2,j)
+        // y(i1,i2,j) >= x(i1,j) + x(i2,j) - 1
+        // then
+        // y(i1,i2,j)*(rating(i1) - rating(i2)) <= 100 for all i1, i2, j
+        let mut acc = 0usize;
+        for n in 0..j {
+            for n2 in 0..i-1 {
+                for n3 in n2+1..i {
+                    // ys = [x(0,1,0), ..., x(1,2,0), ..., x(0,0,1), ..., x(i-1,i,j)]
+                    //      |________ (i-n2) ________|               |
+                    //      |______________ (i*(i-1)/2) _____________|
+                    problem.add_constraint(&[(ys[acc], 1.0), (xs[n2+n*i], -1.0)], ComparisonOp::Le, 0.0);
+                    problem.add_constraint(&[(ys[acc], 1.0), (xs[n3+n*i], -1.0)], ComparisonOp::Le, 0.0);
+                    problem.add_constraint(&[(ys[acc], 1.0), (xs[n2+n*i], -1.0), (xs[n3+n*i], -1.0)], ComparisonOp::Ge, -1.0);
+                    let rating_diff = self.db[&self.queue[n2].into()].abs_diff(self.db[&self.queue[n3].into()]) as f64;
+                    problem.add_constraint(&[(ys[acc], rating_diff)], ComparisonOp::Le, 200.0);
+                    acc += 1;
+                }
+            }
+        }
+        // z <= 200 / N (max difference between teams' ELO)
+        problem.add_constraint(&[(z, 1.0)], ComparisonOp::Le, 100.0 / N as f64);
         // -z <= avg(1) - avg(0) <= z
         problem.add_constraint(&[(avgs[1], 1.0), (avgs[0], -1.0), (z, 1.0)], ComparisonOp::Ge, 0.0);
         problem.add_constraint(&[(avgs[1], 1.0), (avgs[0], -1.0), (z, -1.0)], ComparisonOp::Le, 0.0);
@@ -186,16 +276,19 @@ impl<const N: usize> Slam<N> {
             }
         }
 
-        let g1_players: [SlamIdQueued; N] = g1_players_idx.iter().map(|n| *self.queue.get(*n).expect("player should be in queue")).collect::<Vec<_>>().as_slice().try_into().expect(&format!("{} players should h_ave been found", N));
-        let g2_players: [SlamIdQueued; N] = g2_players_idx.iter().map(|n| *self.queue.get(*n).expect("player should be in queue")).collect::<Vec<_>>().as_slice().try_into().expect(&format!("{} players should h_ave been found", N));
+        let g1_players = g1_players_idx.iter().map(|n| *self.queue.get(*n).expect("player should be in queue")).collect::<Vec<_>>();
+        let g2_players = g2_players_idx.iter().map(|n| *self.queue.get(*n).expect("player should be in queue")).collect::<Vec<_>>();
         
         // removing reverse order
         for idx in all_idx.iter().rev() {
             self.queue.swap_remove(*idx);
         }
 
-        let g1 = Group::new(g1_players, g1_players.map(|p| *self.db.get(&p.into()).expect("player should be in database")).iter().sum());
-        let g2 = Group::new(g1_players, g2_players.map(|p| *self.db.get(&p.into()).expect("player should be in database")).iter().sum());
+        let g1_total_elo = g1_players.iter().map(|p| *self.db.get(&p.into()).expect("player should be in database")).sum();
+        let g2_total_elo = g2_players.iter().map(|p| *self.db.get(&p.into()).expect("player should be in database")).sum();
+
+        let g1 = Group::new(g1_players, g1_total_elo);
+        let g2 = Group::new(g2_players, g2_total_elo);
 
         Some(Match::new(g1, g2))
     }
