@@ -93,7 +93,7 @@ impl SlamConfig {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Clone)]
 pub struct Group {
     players: Vec<SlamIdQueued>,
     total_elo: u64,
@@ -121,7 +121,7 @@ impl std::fmt::Debug for Group {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Clone)]
 pub struct Match {
     g1: Group,
     g2: Group,
@@ -139,6 +139,20 @@ impl Match {
         let mut hasher = DefaultHasher::new();
         self.hash(&mut hasher);
         hasher.finish()
+    }
+
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+
+        v.extend((self.g1.players.len() as u32).to_be_bytes());
+        self.g1.players.iter().map(|id| id.id.to_be_bytes()).for_each(|id_in_bytes| v.extend(id_in_bytes));
+        v.extend(self.g1.total_elo.to_be_bytes());
+
+        v.extend((self.g2.players.len() as u32).to_be_bytes());
+        self.g2.players.iter().map(|id| id.id.to_be_bytes()).for_each(|id_in_bytes| v.extend(id_in_bytes));
+        v.extend(self.g1.total_elo.to_be_bytes());
+
+        v
     }
 }
 
@@ -291,6 +305,10 @@ impl Slam {
         let g2 = Group::new(g2_players, g2_total_elo);
 
         Some(Match::new(g1, g2))
+    }
+
+    pub fn store_match(&mut self, matsh: Match) {
+        self.ongoing_matches.insert(matsh.get_hash(), matsh);
     }
 
     // fn find_best_match(&self, group: Group<1>) -> Option<Group<1>> {
